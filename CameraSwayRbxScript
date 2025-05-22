@@ -16,7 +16,7 @@ local vect3 = Vector3.new()
 
 
 
-UserInputService.MouseIconEnabled = false
+--UserInputService.MouseIconEnabled = true
 
 function lerp(a, b, c)
 	return a + (b - a) * c
