@@ -14,7 +14,7 @@ local int = 5
 local int2 = 5
 local vect3 = Vector3.new()
 
-
+userInputService.MouseIconEnabled = true
 
 
 
