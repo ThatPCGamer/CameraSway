@@ -1,0 +1,321 @@
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local Debris = game:GetService("Debris")
+local SoundService = game:GetService("SoundService")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local humanoidRootPart
+if character then
+	humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+end
+
+local RAYCAST_COUNT = 50
+local MAX_DISTANCE = 75
+local RAYCAST_INTERVAL = 0.5 -- Interval for raycasting
+local IGNORE_LIST_UPDATE_INTERVAL = 10 -- Interval for updating the global ignore list (seconds)
+local MAX_PASS_THROUGH_ATTEMPTS = 10 -- Max invisible/water parts a single ray can pass through
+
+-- IMPORTANT FOR PERFORMANCE: Set RaycastDebug to 'false' for actual gameplay.
+-- Enabling it creates many visual elements and will significantly impact FPS.
+local RaycastDebug = false -- Set to true to see beams, false to hide them
+
+local baseRaycastParams = RaycastParams.new()
+
+-- Helper function to get all parts to ignore (MeshParts and parts with specific names)
+local function getPartsToIgnore()
+	local partsToFilter = {}
+	local keywords = {"Head", "Leg", "Arm", "Grip","Barrelmesh","Handle","Trigger","Knife","Pump","Stock"} -- Keywords to check in part names
+
+	for _, instance in Workspace:GetDescendants() do
+		if instance:IsA("BasePart") then -- Ensure we are checking parts
+			if instance:IsA("MeshPart") then
+				table.insert(partsToFilter, instance)
+			else
+				for _, keyword in keywords do
+					if string.find(instance.Name, keyword) then
+						table.insert(partsToFilter, instance)
+						break -- No need to check other keywords for this instance
+					end
+				end
+			end
+		end
+	end
+	return partsToFilter
+end
+
+-- Initialize baseRaycastParams with parts to ignore and exclude filter type
+baseRaycastParams.FilterDescendantsInstances = getPartsToIgnore()
+baseRaycastParams.FilterType = Enum.RaycastFilterType.Exclude
+-- baseRaycastParams.IgnoreWater = true -- Optional: set to true if you want raycasts to ignore TERRAIN water
+
+local PHI_CONSTANT = math.pi * (3.0 - math.sqrt(5.0))
+local previousReverbType = SoundService.AmbientReverb
+
+SoundService.AmbientReverb = Enum.ReverbType.NoReverb
+previousReverbType = Enum.ReverbType.NoReverb
+
+local function performRaycastsAndGetMetrics()
+	if not humanoidRootPart or not humanoidRootPart.Parent then
+		return 0, 0
+	end
+
+	local hrpPosition = humanoidRootPart.Position -- Initial origin for all rays
+	local collisionCount = 0
+	local totalDistanceOfCollisions = 0
+	local keywordsToPassThrough = {"Head", "Leg", "Arm" ,"Handle" ,"Stock"}
+
+    -- Hoist segmentRayParams creation out of the inner 'attempt' loop
+    local segmentRayParams = RaycastParams.new()
+    segmentRayParams.FilterType = baseRaycastParams.FilterType
+    -- segmentRayParams.IgnoreWater = baseRaycastParams.IgnoreWater -- Uncomment if baseRaycastParams.IgnoreWater is used
+
+	for i_loop = 1, RAYCAST_COUNT do
+		local direction
+		local idx = i_loop - 1
+
+		if RAYCAST_COUNT == 1 then
+			direction = Vector3.new(0, 1, 0)
+		else
+			local y_val = 1 - (idx / (RAYCAST_COUNT - 1)) * 2
+			local radius_at_y = math.sqrt(math.max(0, 1 - y_val*y_val))
+			local theta = PHI_CONSTANT * idx
+			local x_val = math.cos(theta) * radius_at_y
+			local z_val = math.sin(theta) * radius_at_y
+			direction = Vector3.new(x_val, y_val, z_val).Unit
+		end
+
+		local currentOriginForSegments = hrpPosition
+		local remainingDistanceForRay = MAX_DISTANCE
+		local accumulatedDistanceToVisibleHit = 0
+		local hitVisiblePartThisRay = false
+		local finalEffectiveHitPosition = hrpPosition + direction * MAX_DISTANCE -- Default end point
+
+		local ignoredInstancesForThisRay = {}
+		for _, inst in baseRaycastParams.FilterDescendantsInstances do
+			table.insert(ignoredInstancesForThisRay, inst)
+		end
+        
+        -- Update the FilterDescendantsInstances for the segmentRayParams before the loop
+        -- It will be updated within the loop if pass-through parts are encountered
+        segmentRayParams.FilterDescendantsInstances = ignoredInstancesForThisRay
+
+		for attempt = 1, MAX_PASS_THROUGH_ATTEMPTS do
+			if remainingDistanceForRay <= 0 then break end
+
+            -- No need to create RaycastParams.new() here anymore
+            -- segmentRayParams.FilterDescendantsInstances is already pointing to ignoredInstancesForThisRay
+            -- which might be modified below if a pass-through part is hit.
+
+			local segmentResult = Workspace:Raycast(currentOriginForSegments, direction * remainingDistanceForRay, segmentRayParams)
+
+			if segmentResult then
+				local hitInstance = segmentResult.Instance
+				local distanceThisSegment = segmentResult.Distance
+				local isPassThroughPart = false
+
+				if hitInstance and hitInstance:IsA("BasePart") then
+					local instanceName = hitInstance.Name
+					if hitInstance:IsA("MeshPart") then
+						isPassThroughPart = true
+					else
+						for _, keyword in keywordsToPassThrough do
+							if string.find(instanceName, keyword) then
+								isPassThroughPart = true
+								break
+							end
+						end
+					end
+					
+					if not isPassThroughPart then -- Only check transparency/material if not already a pass-through
+						if hitInstance.Transparency == 1 then
+							isPassThroughPart = true
+						elseif segmentResult.Material == Enum.Material.Water then
+							isPassThroughPart = true
+						end
+					end
+				end
+				
+				if isPassThroughPart then
+					if not table.find(ignoredInstancesForThisRay, hitInstance) then
+						table.insert(ignoredInstancesForThisRay, hitInstance)
+                        -- The ignoredInstancesForThisRay table (which segmentRayParams.FilterDescendantsInstances points to)
+                        -- is now updated for the next iteration of this ray's segments.
+					end
+					local offset = direction * 0.01
+					currentOriginForSegments = segmentResult.Position + offset
+					accumulatedDistanceToVisibleHit = accumulatedDistanceToVisibleHit + distanceThisSegment + offset.Magnitude
+					remainingDistanceForRay = remainingDistanceForRay - distanceThisSegment - offset.Magnitude
+				else
+					accumulatedDistanceToVisibleHit = accumulatedDistanceToVisibleHit + distanceThisSegment
+					collisionCount = collisionCount + 1
+					totalDistanceOfCollisions = totalDistanceOfCollisions + accumulatedDistanceToVisibleHit
+					hitVisiblePartThisRay = true
+					finalEffectiveHitPosition = segmentResult.Position
+					
+					if RaycastDebug and hitInstance then
+						print("Ray " .. i_loop .. " hit: " .. hitInstance.Name .. " (Type: " .. hitInstance.ClassName .. ")")
+					end
+					
+					break
+				end
+			else
+				break
+			end
+		end
+
+		if RaycastDebug then
+			local attachment0 = Instance.new("Attachment")
+			attachment0.WorldPosition = hrpPosition
+			attachment0.Parent = Workspace.Terrain
+
+			local attachment1 = Instance.new("Attachment")
+			attachment1.WorldPosition = finalEffectiveHitPosition
+			attachment1.Parent = Workspace.Terrain
+
+			local beamColor
+			if hitVisiblePartThisRay then
+				beamColor = ColorSequence.new(Color3.new(0, 1, 0))
+			else
+				beamColor = ColorSequence.new(Color3.new(1, 0, 0))
+			end
+
+			local beam = Instance.new("Beam")
+			beam.Attachment0 = attachment0
+			beam.Attachment1 = attachment1
+			beam.Color = beamColor
+			beam.FaceCamera = true
+			beam.LightEmission = 1
+			beam.LightInfluence = 0
+			beam.Transparency = NumberSequence.new(0.5)
+			beam.Width0 = 0.05
+			beam.Width1 = 0.05
+			beam.Parent = Workspace.Terrain
+
+			Debris:AddItem(beam, RAYCAST_INTERVAL * 2) -- Increased lifetime slightly for visibility with interval
+			Debris:AddItem(attachment0, RAYCAST_INTERVAL * 2)
+			Debris:AddItem(attachment1, RAYCAST_INTERVAL * 2)
+		end
+	end
+	return collisionCount, totalDistanceOfCollisions
+end
+
+local function determineReverbType(collisionCount, totalDistanceOfCollisions)
+	local collisionRatio = 0
+	if RAYCAST_COUNT > 0 then
+		collisionRatio = collisionCount / RAYCAST_COUNT
+	else
+		return Enum.ReverbType.NoReverb
+	end
+
+	local averageDistance = MAX_DISTANCE
+	if collisionCount > 0 then
+		averageDistance = totalDistanceOfCollisions / collisionCount
+	end
+
+	local newReverbType = Enum.ReverbType.NoReverb
+
+	local HIGH_COLLISION_THRESHOLD = 0.7
+	local MEDIUM_COLLISION_THRESHOLD = 0.4
+	local SHORT_DISTANCE_THRESHOLD = MAX_DISTANCE * 0.1
+	local MEDIUM_DISTANCE_THRESHOLD = MAX_DISTANCE * 0.6
+
+	if collisionCount == 0 then
+		newReverbType = Enum.ReverbType.Plain
+	elseif collisionRatio >= HIGH_COLLISION_THRESHOLD then
+		if averageDistance < SHORT_DISTANCE_THRESHOLD then
+			newReverbType = Enum.ReverbType.SewerPipe
+		elseif averageDistance < MEDIUM_DISTANCE_THRESHOLD then
+			newReverbType = Enum.ReverbType.StoneRoom
+		else
+			newReverbType = Enum.ReverbType.Auditorium
+		end
+	elseif collisionRatio >= MEDIUM_COLLISION_THRESHOLD then
+		if averageDistance < SHORT_DISTANCE_THRESHOLD then
+			newReverbType = Enum.ReverbType.Room
+		elseif averageDistance < MEDIUM_DISTANCE_THRESHOLD then
+			newReverbType = Enum.ReverbType.Hangar
+		else
+			newReverbType = Enum.ReverbType.Arena
+		end
+	else
+		if averageDistance < SHORT_DISTANCE_THRESHOLD then
+			newReverbType = Enum.ReverbType.Forest
+		elseif averageDistance < MEDIUM_DISTANCE_THRESHOLD then
+			newReverbType = Enum.ReverbType.Mountains
+		else
+			newReverbType = Enum.ReverbType.Plain
+		end
+	end
+
+	return newReverbType
+end
+
+local lastRaycastTime = 0
+local lastIgnoreListUpdateTime = 0 -- For throttling getPartsToIgnore()
+local mainLoopConnection
+
+mainLoopConnection = RunService.Heartbeat:Connect(function(deltaTime)
+	if LocalPlayer.Character ~= character then
+		character = LocalPlayer.Character
+		if character then
+			humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+		else
+			humanoidRootPart = nil
+		end
+        -- Reset ignore list update time when character changes, so it updates sooner
+        lastIgnoreListUpdateTime = 0 
+	end
+
+	if not character or not character.Parent or not humanoidRootPart or not humanoidRootPart.Parent then
+		if mainLoopConnection then
+			mainLoopConnection:Disconnect()
+			mainLoopConnection = nil
+		end
+		SoundService.AmbientReverb = Enum.ReverbType.NoReverb
+		if RaycastDebug then
+			print("Character removed, setting AmbientReverb to NoReverb and stopping script logic.")
+		end
+		return
+	end
+
+	local currentTime = os.clock()
+	
+    -- Update the global ignore list less frequently
+    if currentTime - lastIgnoreListUpdateTime >= IGNORE_LIST_UPDATE_INTERVAL then
+        lastIgnoreListUpdateTime = currentTime
+        baseRaycastParams.FilterDescendantsInstances = getPartsToIgnore()
+        if RaycastDebug then
+            print("DynamicReverb: Updated global ignore list for raycasts. Count: " .. #baseRaycastParams.FilterDescendantsInstances)
+        end
+    end
+
+	if currentTime - lastRaycastTime >= RAYCAST_INTERVAL then
+		lastRaycastTime = currentTime
+		
+		-- baseRaycastParams.FilterDescendantsInstances is now updated by the block above, less frequently.
+		
+		if character and not humanoidRootPart then -- Double check HRP, though already handled by character change
+			humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+		end
+		if not humanoidRootPart or not humanoidRootPart.Parent then 
+		    return 
+		end
+
+		local collisionCount, totalDistanceOfCollisions = performRaycastsAndGetMetrics()
+		local newReverbType = determineReverbType(collisionCount, totalDistanceOfCollisions)
+
+		if newReverbType ~= previousReverbType then
+			SoundService.AmbientReverb = newReverbType
+			previousReverbType = newReverbType
+			if RaycastDebug then
+				local avgDistString = "N/A"
+				if collisionCount > 0 then
+					avgDistString = string.format("%.2f", totalDistanceOfCollisions / collisionCount)
+				end
+				print("Updated AmbientReverb to:", newReverbType, "Collisions:", collisionCount, "AvgDist:", avgDistString)
+			end
+		end
+	end
+end)
