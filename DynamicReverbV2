@@ -19,7 +19,7 @@ local MAX_PASS_THROUGH_ATTEMPTS = 10 -- Max invisible/water parts a single ray c
 
 -- IMPORTANT FOR PERFORMANCE: Set RaycastDebug to 'false' for actual gameplay.
 -- Enabling it creates many visual elements and will significantly impact FPS.
-local RaycastDebug = true -- Set to true to see beams, false to hide them
+local RaycastDebug = false -- Set to true to see beams, false to hide them
 
 local baseRaycastParams = RaycastParams.new()
 
