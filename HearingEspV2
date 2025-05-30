@@ -1,0 +1,694 @@
+-- This is a LocalScript for SuperHearing abilities.
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Lighting = game:GetService("Lighting")
+local SoundService = game:GetService("SoundService")
+local RunService = game:GetService("RunService") -- Added RunService
+
+local LocalPlayer = Players.LocalPlayer
+local originalWalkSpeed = 16 -- Default, will be updated when character loads
+
+print("SuperHearing script loaded for " .. LocalPlayer.Name .. ". Initializing humanoid highlighting. Hold 'H' to activate.")
+
+local activeHighlights = {} -- Stores humanoid -> highlightInstance
+local activeTweens = {} -- Stores highlightInstance -> {fillTween, outlineTween}
+local activeTeamWatchers = {} -- Stores highlightInstance -> teamChangedConnection
+local activeColorUpdateLoops = {} -- Stores highlightInstance -> color update coroutine
+local isHKeyDown = false
+local highlightsActivated = false
+local activationDelayThread = nil
+local revealTimerThread = nil -- Timer for max reveal duration
+local renderStepConnection = nil -- For continuous highlight updates
+local walkSpeedEnforceConnection = nil -- For continuously setting walk speed
+local SUPER_HEARING_WALK_SPEED = 4 -- Walk speed during super hearing
+
+local DIM_DURATION = 0.6
+local VISIBLE_HIGHLIGHT_TRANSPARENCY = 0.7 -- This is the *minimum* transparency (most opaque state)
+
+-- Hearing/Visibility Constants
+local MAX_HEARING_DISTANCE = 150
+local MAX_SPEED_FOR_VISIBILITY = 11 -- Assumes default WalkSpeed. Adjust if needed.
+local MIN_SPEED_MULTIPLIER = 0.1 -- Visibility multiplier for idle/very slow players
+local MAX_SPEED_MULTIPLIER = 1.25 -- Visibility multiplier for players at or above MAX_SPEED_FOR_VISIBILITY
+
+-- Heartbeat Sound variables
+local HEARTBEAT_SOUND_ID = "rbxassetid://6500844850"
+local HEARTBEAT_RAMP_DURATION = 2 -- seconds for volume ramp-up
+local HEARTBEAT_TARGET_VOLUME = 1 -- Target volume for heartbeat
+local heartbeatSound = Instance.new("Sound")
+local heartbeatVolumeTween = nil -- Stores the current volume tween for the heartbeat
+
+-- Starting Sound variables
+local STARTING_SOUND_ID = "rbxassetid://125858296080402"
+local startingSound -- Declare startingSound variable
+
+-- Max Reveal Duration Sound variables
+local MAX_REVEAL_SOUND_ID = "rbxassetid://129842080575449"
+local maxRevealDurationSound -- Declare maxRevealDurationSound variable
+
+-- Visual Effect Variables
+local camera = Workspace.CurrentCamera
+local originalFOV
+local colorCorrectionEffect
+local fovTween
+local saturationTween
+
+local TARGET_FOV = 50
+local TARGET_SATURATION_EFFECT = -0.8
+local VISUAL_TWEEN_DURATION = 0.5
+
+local MAX_REVEAL_DURATION = 5 -- Max duration for highlights to be active
+local superHearingActive = false -- Tracks if the ability is currently "on"
+
+-- K-Key Deactivation Variables
+local kKeyPressTimestamps = {}
+local K_PRESS_COUNT_TARGET = 5
+local K_PRESS_TIME_WINDOW = 2 -- seconds
+
+-- Initialize Heartbeat Sound
+heartbeatSound.SoundId = HEARTBEAT_SOUND_ID
+heartbeatSound.Looped = true
+heartbeatSound.Volume = 0
+heartbeatSound.Name = "HeartbeatSound"
+heartbeatSound.Parent = script
+
+-- Initialize Starting Sound
+startingSound = Instance.new("Sound")
+startingSound.SoundId = STARTING_SOUND_ID
+startingSound.Looped = false
+startingSound.Volume = 1.5
+startingSound.Name = "StartingSound"
+startingSound.Parent = script
+
+-- Initialize Max Reveal Duration Sound
+maxRevealDurationSound = Instance.new("Sound")
+maxRevealDurationSound.SoundId = MAX_REVEAL_SOUND_ID
+maxRevealDurationSound.Looped = false
+maxRevealDurationSound.Volume = 2
+maxRevealDurationSound.Name = "MaxRevealDurationSound"
+maxRevealDurationSound.Parent = script
+
+-- Initialize Visual Effects
+if camera then
+	originalFOV = camera.FieldOfView
+else
+	warn("SuperHearing: Workspace.CurrentCamera not found at initialization!")
+end
+
+colorCorrectionEffect = Instance.new("ColorCorrectionEffect")
+colorCorrectionEffect.Name = "SuperHearingSaturationEffect"
+colorCorrectionEffect.Saturation = 0
+colorCorrectionEffect.Enabled = true
+colorCorrectionEffect.Parent = Lighting
+
+
+local inputBeganConnection
+local inputEndedConnection
+
+-- Forward declaration for updateAllHighlightsState
+local updateAllHighlightsState
+local activateSuperHearing -- Forward declare for onCharacterReady
+local deactivateSuperHearing -- Forward declare for onCharacterReady
+local updateHighlightColorFromTeam -- Forward declare for addHighlight
+local cleanupScriptResources -- Forward declare for K-key deactivation and script.Destroying
+
+-- Function to animate a single highlight's visibility (MODIFIED)
+local function animateHighlight(highlightInstance, targetFillTransparency, targetOutlineTransparency)
+	if not highlightInstance or not highlightInstance.Parent then
+		if activeTweens[highlightInstance] then
+			if activeTweens[highlightInstance].fill then activeTweens[highlightInstance].fill:Cancel() end
+			if activeTweens[highlightInstance].outline then activeTweens[highlightInstance].outline:Cancel() end
+			activeTweens[highlightInstance] = nil
+		end
+		return
+	end
+
+	local existingTweenEntry = activeTweens[highlightInstance]
+	if existingTweenEntry then
+		if existingTweenEntry.fill then existingTweenEntry.fill:Cancel() end
+		if existingTweenEntry.outline then existingTweenEntry.outline:Cancel() end
+	end
+
+	targetFillTransparency = math.clamp(targetFillTransparency, 0, 1)
+	targetOutlineTransparency = math.clamp(targetOutlineTransparency, 0, 1)
+
+	if highlightInstance.FillTransparency == targetFillTransparency and highlightInstance.OutlineTransparency == targetOutlineTransparency then
+		if not (existingTweenEntry and (existingTweenEntry.fill or existingTweenEntry.outline)) then
+			activeTweens[highlightInstance] = nil
+		end
+		return
+	end
+
+	local tweenInfo = TweenInfo.new(DIM_DURATION, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	local fillTween = TweenService:Create(highlightInstance, tweenInfo, { FillTransparency = targetFillTransparency })
+	local outlineTween = TweenService:Create(highlightInstance, tweenInfo, { OutlineTransparency = targetOutlineTransparency })
+
+	activeTweens[highlightInstance] = { fill = fillTween, outline = outlineTween }
+	local fillConn, outlineConn
+
+	local function onComplete(completedTween)
+		local currentTweens = activeTweens[highlightInstance]
+		if not currentTweens then return end 
+
+		if completedTween == currentTweens.fill then
+			currentTweens.fill = nil
+			if fillConn then fillConn:Disconnect(); fillConn = nil; end
+		elseif completedTween == currentTweens.outline then
+			currentTweens.outline = nil
+			if outlineConn then outlineConn:Disconnect(); outlineConn = nil; end
+		end
+
+		if not currentTweens.fill and not currentTweens.outline then
+			activeTweens[highlightInstance] = nil
+		end
+	end
+
+	fillConn = fillTween.Completed:Connect(function() onComplete(fillTween) end)
+	outlineConn = outlineTween.Completed:Connect(function() onComplete(outlineTween) end)
+
+	fillTween:Play()
+	outlineTween:Play()
+end
+
+-- NEW function to calculate target transparency
+local function calculateTargetTransparency(otherCharacterModel, localPlayerHRP)
+	if not otherCharacterModel or not otherCharacterModel.Parent then return 1 end
+	local otherPlayerHRP = otherCharacterModel:FindFirstChild("HumanoidRootPart")
+	local otherPlayerHumanoid = otherCharacterModel:FindFirstChildOfClass("Humanoid")
+
+	if not localPlayerHRP or not otherPlayerHRP or not otherPlayerHumanoid then
+		return 1 -- Cannot determine, so make it fully transparent
+	end
+
+	-- Distance Calculation
+	local distance = (localPlayerHRP.Position - otherPlayerHRP.Position).Magnitude
+	local distanceFactor = 1 - math.clamp(distance / MAX_HEARING_DISTANCE, 0, 1) -- 1 for close, 0 for far
+
+	-- Speed Calculation
+	local otherPlayerSpeed = otherPlayerHRP.AssemblyLinearVelocity.Magnitude
+	local speedRatio = math.clamp(otherPlayerSpeed / MAX_SPEED_FOR_VISIBILITY, 0, 1)
+	local speedMultiplier = MIN_SPEED_MULTIPLIER + (MAX_SPEED_MULTIPLIER - MIN_SPEED_MULTIPLIER) * speedRatio
+
+	-- Combined Transparency
+	local maxOpacity = (1 - VISIBLE_HIGHLIGHT_TRANSPARENCY) -- e.g., 1 - 0.7 = 0.3
+	local effectiveOpacity = maxOpacity * distanceFactor * speedMultiplier
+
+	local finalTransparency = 1 - effectiveOpacity
+	return math.clamp(finalTransparency, VISIBLE_HIGHLIGHT_TRANSPARENCY, 1)
+end
+
+-- MODIFIED: This function is now the core update logic
+function updateAllHighlightsState()
+	local localPlayerChar = LocalPlayer.Character
+	if not localPlayerChar then return end
+	local localPlayerHRP = localPlayerChar:FindFirstChild("HumanoidRootPart")
+	if not localPlayerHRP then return end
+
+	local showHighlightsGlobally = isHKeyDown and highlightsActivated and superHearingActive
+
+	for humanoid, highlightInstance in activeHighlights do
+		if highlightInstance and highlightInstance.Parent then
+			local characterModel = highlightInstance.Adornee
+			if not characterModel then
+				animateHighlight(highlightInstance, 1, 1)
+				continue
+			end
+
+			if showHighlightsGlobally then
+				local targetTransparency = calculateTargetTransparency(characterModel, localPlayerHRP)
+				animateHighlight(highlightInstance, targetTransparency, targetTransparency)
+			else
+				animateHighlight(highlightInstance, 1, 1) 
+			end
+		elseif activeHighlights[humanoid] then -- Stale entry check
+			activeHighlights[humanoid] = nil
+		end
+	end
+end
+
+
+function deactivateSuperHearing()
+	if walkSpeedEnforceConnection then
+		walkSpeedEnforceConnection:Disconnect()
+		walkSpeedEnforceConnection = nil
+	end
+
+	local character = LocalPlayer.Character
+	if character then
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			humanoid.WalkSpeed = originalWalkSpeed -- Restore original walk speed
+		end
+	end
+
+	if not superHearingActive and not highlightsActivated then 
+		if activationDelayThread then task.cancel(activationDelayThread); activationDelayThread = nil; end
+		if revealTimerThread then task.cancel(revealTimerThread); revealTimerThread = nil; end
+		return
+	end
+
+	superHearingActive = false 
+	highlightsActivated = false 
+
+	if activationDelayThread then
+		task.cancel(activationDelayThread)
+		activationDelayThread = nil
+	end
+	if revealTimerThread then
+		task.cancel(revealTimerThread)
+		revealTimerThread = nil
+	end
+
+	if renderStepConnection then
+		renderStepConnection:Disconnect()
+		renderStepConnection = nil
+	end
+	updateAllHighlightsState() -- Ensure highlights tween to transparent
+
+	if heartbeatVolumeTween then
+		heartbeatVolumeTween:Cancel()
+		heartbeatVolumeTween = nil
+	end
+
+	if heartbeatSound and (heartbeatSound.Playing or heartbeatSound.Volume > 0.01) then
+		local fadeOutTweenInfo = TweenInfo.new(DIM_DURATION, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		heartbeatVolumeTween = TweenService:Create(heartbeatSound, fadeOutTweenInfo, { Volume = 0 })
+		local tweenConnection
+		tweenConnection = heartbeatVolumeTween.Completed:Connect(function()
+			if heartbeatSound then heartbeatSound:Stop() end
+			if tweenConnection then tweenConnection:Disconnect() end
+			if heartbeatVolumeTween and heartbeatVolumeTween.Status ~= Enum.TweenStatus.Playing then
+				heartbeatVolumeTween = nil
+			end
+		end)
+		heartbeatVolumeTween:Play()
+	elseif heartbeatSound then
+		heartbeatSound:Stop()
+		heartbeatSound.Volume = 0
+	end
+
+	if camera and colorCorrectionEffect and originalFOV then
+		local visualTweenInfo = TweenInfo.new(VISUAL_TWEEN_DURATION, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		if fovTween then fovTween:Cancel() end
+		fovTween = TweenService:Create(camera, visualTweenInfo, { FieldOfView = originalFOV })
+		fovTween:Play()
+		if saturationTween then saturationTween:Cancel() end
+		saturationTween = TweenService:Create(colorCorrectionEffect, visualTweenInfo, { Saturation = 0 }) 
+		saturationTween:Play()
+	end
+end
+
+function activateSuperHearing()
+	if superHearingActive then return end 
+
+	local character = LocalPlayer.Character
+	local humanoid
+	if character then
+		humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			-- originalWalkSpeed should be set by onCharacterReady by this point
+			humanoid.WalkSpeed = SUPER_HEARING_WALK_SPEED -- Set walk speed
+		else
+			warn("SuperHearing: Humanoid not found during activation.")
+			deactivateSuperHearing() -- Ensure partial activation doesn't linger
+			return -- Cannot activate fully without humanoid
+		end
+	else
+		warn("SuperHearing: Character not found during activation.")
+		deactivateSuperHearing() -- Ensure partial activation doesn't linger
+		return -- Cannot activate without character
+	end
+
+	superHearingActive = true
+
+	-- Start enforcing walk speed
+	if not walkSpeedEnforceConnection then
+		walkSpeedEnforceConnection = RunService.Heartbeat:Connect(function()
+			local char = LocalPlayer.Character
+			if char then
+				local hum = char:FindFirstChildOfClass("Humanoid")
+				if hum and hum.WalkSpeed ~= SUPER_HEARING_WALK_SPEED then
+					hum.WalkSpeed = SUPER_HEARING_WALK_SPEED
+				end
+			end
+		end)
+	end
+
+	if startingSound then SoundService:PlayLocalSound(startingSound) 
+	else warn("SuperHearing: startingSound instance is nil.") end
+
+	if heartbeatVolumeTween then heartbeatVolumeTween:Cancel(); heartbeatVolumeTween = nil; end
+	if heartbeatSound then
+		heartbeatSound.Volume = 0
+		if not heartbeatSound.Playing then heartbeatSound:Play() end
+		local rampUpTweenInfo = TweenInfo.new(HEARTBEAT_RAMP_DURATION, Enum.EasingStyle.Linear)
+		heartbeatVolumeTween = TweenService:Create(heartbeatSound, rampUpTweenInfo, { Volume = HEARTBEAT_TARGET_VOLUME })
+		heartbeatVolumeTween:Play()
+	else warn("SuperHearing: heartbeatSound instance is nil.") end
+
+	local visualTweenInfo 
+	if camera and colorCorrectionEffect then
+		visualTweenInfo = TweenInfo.new(VISUAL_TWEEN_DURATION, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		if saturationTween then saturationTween:Cancel() end
+		saturationTween = TweenService:Create(colorCorrectionEffect, visualTweenInfo, { Saturation = TARGET_SATURATION_EFFECT })
+		saturationTween:Play()
+	end
+
+	if activationDelayThread then task.cancel(activationDelayThread); activationDelayThread = nil; end
+	activationDelayThread = task.delay(HEARTBEAT_RAMP_DURATION, function() 
+		activationDelayThread = nil 
+		if not (isHKeyDown and superHearingActive) then -- Check both isHKeyDown and superHearingActive
+			if superHearingActive or highlightsActivated then deactivateSuperHearing() end
+			return 
+		end
+
+		highlightsActivated = true
+		updateAllHighlightsState() -- Initial update for highlights
+		if not renderStepConnection then
+			renderStepConnection = RunService.RenderStepped:Connect(updateAllHighlightsState)
+		end
+
+		if camera and visualTweenInfo then 
+			if fovTween then fovTween:Cancel() end
+			fovTween = TweenService:Create(camera, visualTweenInfo, { FieldOfView = TARGET_FOV })
+			fovTween:Play()
+		end
+
+		if revealTimerThread then task.cancel(revealTimerThread); revealTimerThread = nil; end
+		revealTimerThread = task.delay(MAX_REVEAL_DURATION, function()
+			revealTimerThread = nil 
+			if isHKeyDown and superHearingActive then -- Check both
+				if maxRevealDurationSound then SoundService:PlayLocalSound(maxRevealDurationSound) 
+				else warn("SuperHearing: maxRevealDurationSound instance is nil.") end
+				deactivateSuperHearing() 
+			end
+		end)
+	end)
+end
+
+-- MODIFIED updateHighlightColorFromTeam function
+function updateHighlightColorFromTeam(targetHighlight)
+	-- If highlight is gone or its adornee is gone, nothing to update.
+	-- Cleanup of watchers/loops is handled by humanoid.Destroying or script.Destroying.
+	if not targetHighlight or not targetHighlight.Parent then
+		return
+	end
+
+	local adorneeCharacter = targetHighlight.Adornee
+	if not adorneeCharacter or not adorneeCharacter.Parent then
+		-- Adornee is invalid (e.g., removed from workspace).
+		-- Set to default color as a fallback, assuming highlight will be cleaned up soon.
+		targetHighlight.FillColor = Color3.fromRGB(255, 255, 0)
+		targetHighlight.OutlineColor = Color3.fromRGB(255, 255, 0)
+		return
+	end
+
+	local currentCharacterPlayer = Players:GetPlayerFromCharacter(adorneeCharacter)
+	local colorToSet = Color3.fromRGB(255, 255, 0) -- Default to yellow
+
+	if currentCharacterPlayer then
+		local teamInstance = currentCharacterPlayer.Team
+		if teamInstance then
+			if typeof(teamInstance) == "Instance" and teamInstance:IsA("Team") then
+				if typeof(teamInstance.TeamColor) == "BrickColor" then
+					colorToSet = teamInstance.TeamColor.Color
+				else
+					local teamName = teamInstance.Name or "Unnamed Team"
+					warn("SuperHearing: Player " .. currentCharacterPlayer.Name .. "'s team '" .. teamName .. "' has an invalid TeamColor property. Expected BrickColor, got " .. typeof(teamInstance.TeamColor) .. ". Value: " .. tostring(teamInstance.TeamColor))
+				end
+			else
+				local teamType = typeof(teamInstance)
+				local details = "Type: " .. teamType
+				if teamType == "Instance" then
+					details = details .. ", ClassName: " .. teamInstance.ClassName
+				end
+				warn("SuperHearing: Player " .. currentCharacterPlayer.Name .. "'s .Team property is not a valid Team instance. Expected 'Team' object, got " .. details .. ". Value: " .. tostring(teamInstance))
+			end
+			-- If teamInstance is nil, color remains default yellow.
+		end
+		-- If currentCharacterPlayer is nil (e.g., an NPC), color remains default yellow.
+	end
+
+	targetHighlight.FillColor = colorToSet
+	targetHighlight.OutlineColor = colorToSet
+end
+
+
+local function addHighlight(humanoid)
+	if not humanoid or not humanoid:IsA("Humanoid") then return end
+	local characterModel = humanoid.Parent
+	if not characterModel or not characterModel:IsA("Model") then return end
+	if LocalPlayer and LocalPlayer.Character and characterModel == LocalPlayer.Character then return end
+
+	if activeHighlights[humanoid] and activeHighlights[humanoid].Parent then
+		return
+	end
+
+	local highlight = Instance.new("Highlight")
+	highlight.Name = "SuperHearingHighlight"
+	highlight.Adornee = characterModel
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.Enabled = true 
+	highlight.Parent = characterModel
+
+	activeHighlights[humanoid] = highlight -- Store it
+
+	-- This 'player' variable is used for setting up the initial TeamChanged signal.
+	-- updateHighlightColorFromTeam will fetch its own player reference.
+	local playerForSignal = Players:GetPlayerFromCharacter(characterModel)
+
+	updateHighlightColorFromTeam(highlight) -- Initial update using the new robust function
+
+	if playerForSignal then
+		local teamChangedConnection
+		teamChangedConnection = playerForSignal:GetPropertyChangedSignal("Team"):Connect(function()
+			if highlight and highlight.Parent and playerForSignal and playerForSignal.Parent then
+				updateHighlightColorFromTeam(highlight) -- This will use the adornee's current player
+			elseif teamChangedConnection then
+				teamChangedConnection:Disconnect()
+				if activeTeamWatchers[highlight] == teamChangedConnection then
+					activeTeamWatchers[highlight] = nil
+				end
+				teamChangedConnection = nil 
+			end
+		end)
+		activeTeamWatchers[highlight] = teamChangedConnection
+	end
+
+	-- Start periodic color update loop
+	local colorUpdateCoroutine = task.spawn(function()
+		while true do
+			local success = task.wait(5) -- Wait for 5 seconds
+			if not success then break end -- Coroutine was cancelled
+
+			if not (highlight and highlight.Parent) then break end -- Highlight is gone
+
+			updateHighlightColorFromTeam(highlight) -- Calls the modified function
+		end
+	end)
+	activeColorUpdateLoops[highlight] = colorUpdateCoroutine
+
+
+	local showHighlightsNow = isHKeyDown and highlightsActivated and superHearingActive
+	if showHighlightsNow then
+		local localPlayerChar = LocalPlayer.Character
+		local localPlayerHRP = localPlayerChar and localPlayerChar:FindFirstChild("HumanoidRootPart")
+		if localPlayerHRP then
+			local initialTransparency = calculateTargetTransparency(characterModel, localPlayerHRP)
+			highlight.FillTransparency = initialTransparency
+			highlight.OutlineTransparency = initialTransparency
+		else
+			highlight.FillTransparency = 1
+			highlight.OutlineTransparency = 1
+		end
+	else
+		highlight.FillTransparency = 1
+		highlight.OutlineTransparency = 1
+	end
+
+	local humanoidDestroyingConnection
+	humanoidDestroyingConnection = humanoid.Destroying:Connect(function()
+		local oldHighlight = activeHighlights[humanoid] 
+		if oldHighlight and oldHighlight == highlight then 
+			local tweens = activeTweens[oldHighlight]
+			if tweens then
+				if tweens.fill then tweens.fill:Cancel() end
+				if tweens.outline then tweens.outline:Cancel() end
+				activeTweens[oldHighlight] = nil
+			end
+
+			local watcherConn = activeTeamWatchers[oldHighlight] 
+			if watcherConn then
+				watcherConn:Disconnect()
+				activeTeamWatchers[oldHighlight] = nil
+			end
+
+			local updaterCoroutine = activeColorUpdateLoops[oldHighlight]
+			if updaterCoroutine then
+				task.cancel(updaterCoroutine)
+				activeColorUpdateLoops[oldHighlight] = nil
+			end
+
+			oldHighlight:Destroy()
+			activeHighlights[humanoid] = nil
+		end
+		if humanoidDestroyingConnection then humanoidDestroyingConnection:Disconnect() end
+	end)
+end
+
+local function processAllHumanoids()
+	for _, descendant in Workspace:GetDescendants() do
+		if descendant:IsA("Humanoid") then addHighlight(descendant) end
+	end
+	Workspace.DescendantAdded:Connect(function(descendant)
+		if descendant:IsA("Humanoid") then addHighlight(descendant) end
+	end)
+end
+
+-- Function to handle character loading and speed initialization
+local function onCharacterReady(character)
+	-- Wait for the Humanoid, but with a timeout to prevent infinite yield
+	local humanoid = character:WaitForChild("Humanoid", 5) 
+	if not humanoid then 
+		warn("SuperHearing: Humanoid not found for character in onCharacterReady (timed out or missing).")
+		return 
+	end
+
+	originalWalkSpeed = humanoid.WalkSpeed -- Store the character's natural walk speed
+	print("SuperHearing: Character ready. Original WalkSpeed: " .. originalWalkSpeed)
+
+	if UserInputService:IsKeyDown(Enum.KeyCode.H) then
+		isHKeyDown = true -- Sync state variable
+		if activateSuperHearing then -- Ensure activateSuperHearing is defined
+			activateSuperHearing() -- Re-activate ability if key is held through respawn
+		end
+	else
+		isHKeyDown = false -- Ensure state is correct if key was released
+	end
+end
+
+-- Extracted cleanup function
+function cleanupScriptResources()
+	if deactivateSuperHearing then deactivateSuperHearing() end 
+
+	if renderStepConnection then 
+		renderStepConnection:Disconnect()
+		renderStepConnection = nil
+	end
+
+	if heartbeatVolumeTween then heartbeatVolumeTween:Cancel(); heartbeatVolumeTween = nil; end
+	for _, tweens in activeTweens do
+		if tweens.fill then tweens.fill:Cancel() end
+		if tweens.outline then tweens.outline:Cancel() end
+	end
+	activeTweens = {}
+
+	for hl, conn in activeTeamWatchers do
+		if conn then
+			conn:Disconnect()
+		end
+	end
+	activeTeamWatchers = {}
+
+	for hl, co in activeColorUpdateLoops do 
+		if co then
+			task.cancel(co)
+		end
+	end
+	activeColorUpdateLoops = {}
+
+	for _, highlightInstance in activeHighlights do
+		if highlightInstance and highlightInstance.Parent then highlightInstance:Destroy() end
+	end
+	activeHighlights = {}
+
+	if heartbeatSound then heartbeatSound:Stop(); if heartbeatSound.Parent then heartbeatSound:Destroy() end; heartbeatSound = nil; end
+	if startingSound then if startingSound.Parent then startingSound:Destroy() end; startingSound = nil; end
+	if maxRevealDurationSound then if maxRevealDurationSound.Parent then maxRevealDurationSound:Destroy() end; maxRevealDurationSound = nil; end
+
+	fovTween = nil; saturationTween = nil
+	if camera and originalFOV and camera.FieldOfView ~= originalFOV then camera.FieldOfView = originalFOV end
+	if colorCorrectionEffect then
+		if colorCorrectionEffect.Parent then colorCorrectionEffect.Saturation = 0; colorCorrectionEffect:Destroy(); end
+		colorCorrectionEffect = nil
+	end
+
+	if inputBeganConnection then inputBeganConnection:Disconnect(); inputBeganConnection = nil; end
+	if inputEndedConnection then inputEndedConnection:Disconnect(); inputEndedConnection = nil; end
+
+	if walkSpeedEnforceConnection then
+		walkSpeedEnforceConnection:Disconnect()
+		walkSpeedEnforceConnection = nil
+	end
+
+	-- Also disconnect CharacterAdded and DescendantAdded to fully stop the script's activities
+	-- Note: This is tricky as these connections are not stored in variables in the original script.
+	-- For a full "kill", these would ideally be disconnected. However, for StarterCharacterScripts,
+	-- disabling the script and cleaning up current resources is usually sufficient for the current character.
+	-- The script will re-run on respawn anyway.
+	-- For now, the existing cleanup is extensive for active effects.
+end
+
+
+-- Character Setup: Connect to CharacterAdded and handle initial character
+LocalPlayer.CharacterAdded:Connect(onCharacterReady)
+if LocalPlayer.Character then
+	onCharacterReady(LocalPlayer.Character)
+end
+
+-- Input Handlers
+inputBeganConnection = UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
+	 -- If script was disabled by K, do nothing.
+
+	if not gameProcessedEvent then
+		if input.KeyCode == Enum.KeyCode.H then
+			isHKeyDown = true
+			if activateSuperHearing then activateSuperHearing() end
+		elseif input.KeyCode == Enum.KeyCode.K then
+			local currentTime = tick()
+			table.insert(kKeyPressTimestamps, currentTime)
+
+			-- Filter out old timestamps
+			local validTimestamps = {}
+			for i = 1, #kKeyPressTimestamps do
+				if currentTime - kKeyPressTimestamps[i] <= K_PRESS_TIME_WINDOW then
+					table.insert(validTimestamps, kKeyPressTimestamps[i])
+				end
+			end
+			kKeyPressTimestamps = validTimestamps
+
+			if #kKeyPressTimestamps >= K_PRESS_COUNT_TARGET then
+				print("SuperHearing: K key pressed " .. K_PRESS_COUNT_TARGET .. " times. Deactivating and disabling script.")
+
+				if cleanupScriptResources then
+					cleanupScriptResources()
+				end
+
+				script.Disabled = true 
+				kKeyPressTimestamps = {} 
+			end
+		end
+	end
+end)
+
+inputEndedConnection = UserInputService.InputEnded:Connect(function(input)
+	if script.Disabled then return end -- If script was disabled by K, do nothing.
+
+	if input.KeyCode == Enum.KeyCode.H then
+		isHKeyDown = false
+		if deactivateSuperHearing then deactivateSuperHearing() end
+	end
+end)
+
+if not camera then 
+	camera = Workspace.CurrentCamera
+	if camera and not originalFOV then originalFOV = camera.FieldOfView end
+end
+
+processAllHumanoids()
+
+script.Destroying:Connect(cleanupScriptResources)
+
