@@ -1,0 +1,219 @@
+local UserInputService = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:FindFirstChildOfClass("Humanoid")
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+local camera = workspace.CurrentCamera
+
+local dashSpeed = 400  -- Adjust this value to control the dash speed
+local dashDuration = 0.2
+local tweenDuration = 0.09  -- New variable to control the duration of the FOV tween
+local dashFOVIncrease = 10  -- Amount to increase FOV during dash
+
+local kPressCount = 0
+local kPressStartTime = 0
+local kPressLimit = 5
+local kPressDuration = 5
+
+local dashAnimationId = "rbxassetid://135808540475583"
+local dashAnimation = Instance.new("Animation")
+dashAnimation.AnimationId = dashAnimationId
+local animationTrack = humanoid:LoadAnimation(dashAnimation)
+
+-- Set the animation priority to Action to ensure it overrides other animations
+animationTrack.Priority = Enum.AnimationPriority.Action
+
+local animationSpeedMultiplier = 2  -- New variable to control the speed of the dash animation
+
+local canDash = true  -- New variable to track dash availability
+local dashCooldown = 2  -- Cooldown duration in seconds
+
+-- Enraged variables
+local enragedDuration = 30
+local enragedSpeed = 63
+local enragedCooldown = 35  -- Cooldown duration for the enraged ability
+local enragedAnimationId1 = "rbxassetid://18715565490"
+local enragedAnimationId2 = "rbxassetid://17638256917"
+local enragedAnimation1 = Instance.new("Animation")
+enragedAnimation1.AnimationId = enragedAnimationId1
+local enragedAnimationTrack1 = humanoid:LoadAnimation(enragedAnimation1)
+enragedAnimationTrack1.Priority = Enum.AnimationPriority.Action
+
+local enragedAnimation2 = Instance.new("Animation")
+enragedAnimation2.AnimationId = enragedAnimationId2
+local enragedAnimationTrack2 = humanoid:LoadAnimation(enragedAnimation2)
+enragedAnimationTrack2.Priority = Enum.AnimationPriority.Movement
+
+local isEnraged = false
+local canEnrage = true  -- Track if enraged ability can be used
+local originalWalkSpeed = humanoid.WalkSpeed  -- Store the original walk speed
+local delayPhaseDuration = 0.2  -- Variable to control the delay phase duration
+
+local enragedCooldownStart -- Declare the variable outside the function
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if input.KeyCode == Enum.KeyCode.G and not gameProcessed and canDash and not script.Disabled and not isEnraged then
+		print("Dash activated")
+		canDash = false  -- Disable dashing
+
+		-- Update OriginalFov before the dash phase
+		local originalFOV = camera.FieldOfView
+		local dashFOV = originalFOV + dashFOVIncrease
+
+		originalWalkSpeed = humanoid.WalkSpeed  -- Update original walk speed
+		humanoid.WalkSpeed = dashSpeed
+
+		-- Stop all currently playing animations before starting the dash animation
+		for _, track in humanoid:GetPlayingAnimationTracks() do
+			track:Stop()
+		end
+
+		-- Play dash animation with speed multiplier
+		animationTrack:Play()
+		animationTrack:AdjustSpeed(animationSpeedMultiplier)
+
+		-- Tween FOV to dashFOV
+		local tweenInfo = TweenInfo.new(tweenDuration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
+		local tween = TweenService:Create(camera, tweenInfo, {FieldOfView = dashFOV})
+		tween:Play()
+
+		task.wait(dashDuration)
+
+		-- Reset WalkSpeed to original
+		humanoid.WalkSpeed = originalWalkSpeed
+
+		-- Tween FOV back to originalFOV
+		local tweenBack = TweenService:Create(camera, tweenInfo, {FieldOfView = originalFOV})
+		tweenBack:Play()
+		tweenBack.Completed:Wait()  -- Ensure the FOV is fully reverted before proceeding
+
+		-- Set a delay for the cooldown
+		task.delay(dashCooldown, function()
+			canDash = true  -- Re-enable dashing after cooldown
+			print("Dash cooldown ended")
+		end)
+	elseif input.KeyCode == Enum.KeyCode.G and not gameProcessed and not canDash then
+		local remainingCooldown = dashCooldown - (tick() - (dashCooldown - 2))
+		print("Dash on cooldown, " .. math.max(0, math.floor(remainingCooldown)) .. " seconds left")
+	elseif input.KeyCode == Enum.KeyCode.Q and not gameProcessed and not isEnraged and canEnrage then
+		print("Enrage activated")
+		isEnraged = true
+		canEnrage = false  -- Disable enraged ability until cooldown is over
+		originalWalkSpeed = humanoid.WalkSpeed  -- Update original walk speed before enraged
+
+		-- Start the cooldown immediately after pressing Q
+		enragedCooldownStart = tick() -- Initialize the cooldown start time
+
+		-- Add a 1-second delay before starting the enraged phase
+		task.wait(1)
+
+		-- Continuously set walk speed to enraged speed during the enraged phase
+		local enragedStartTime = tick()
+		while tick() - enragedStartTime < enragedDuration do
+			if not isEnraged then break end  -- Ensure loop stops if enraged is canceled
+			humanoid.WalkSpeed = enragedSpeed
+			task.wait(0.1)  -- Small wait to prevent excessive loop execution
+		end
+
+		-- Reset walk speed to original after enraged phase
+		humanoid.WalkSpeed = originalWalkSpeed
+		isEnraged = false  -- Reset enraged state
+
+		-- Stop enraged animations
+		enragedAnimationTrack1:Stop()
+		enragedAnimationTrack2:Stop()
+
+		-- Set a cooldown for the enraged ability
+		task.delay(enragedCooldown, function()
+			canEnrage = true  -- Re-enable enraged ability after cooldown
+			print("Enrage cooldown ended, canEnrage: " .. tostring(canEnrage))
+		end)
+
+		-- Print remaining cooldown time for enraged ability
+		while tick() - enragedCooldownStart < enragedCooldown do
+			local remainingCooldown = enragedCooldown - (tick() - enragedCooldownStart)
+			print("Enrage on cooldown, " .. math.max(0, math.floor(remainingCooldown)) .. " seconds left, canEnrage: " .. tostring(canEnrage))
+			task.wait(1)
+		end
+
+		-- Ensure canEnrage is reset properly after the cooldown countdown
+		task.delay(1, function()
+			if tick() - enragedCooldownStart >= enragedCooldown then
+				canEnrage = true
+				print("Enrage cooldown ended, canEnrage is now: " .. tostring(canEnrage))
+			end
+		end)
+
+	elseif input.KeyCode == Enum.KeyCode.Q and not gameProcessed and not canEnrage then
+		if enragedCooldownStart then
+			local remainingCooldown = enragedCooldown - (tick() - enragedCooldownStart)
+			print("Enrage on cooldown, " .. math.max(0, math.floor(remainingCooldown)) .. " seconds left, canEnrage: " .. tostring(canEnrage))
+		else
+			print("Enrage cooldown not started yet.")
+		end
+	elseif input.KeyCode == Enum.KeyCode.R and not gameProcessed and isEnraged then
+		print("Enrage canceled, dashing forward")
+		-- Cancel enraged effect
+		isEnraged = false
+
+		-- Loop the player's walk speed to 0 during the delay phase
+		local delayStartTime = tick()
+		while tick() - delayStartTime < delayPhaseDuration do
+			humanoid.WalkSpeed = 0
+			task.wait(0.1)  -- Small wait to prevent excessive loop execution
+		end
+
+		-- Execute dash logic when R is pressed during enraged phase
+		local originalFOV = camera.FieldOfView
+		local dashFOV = originalFOV + dashFOVIncrease
+
+		humanoid.WalkSpeed = dashSpeed
+
+		-- Stop all currently playing animations before starting the dash animation
+		for _, track in humanoid:GetPlayingAnimationTracks() do
+			track:Stop()
+		end
+
+		-- Play dash animation with speed multiplier
+		animationTrack:Play()
+		animationTrack:AdjustSpeed(animationSpeedMultiplier)
+
+		-- Tween FOV to dashFOV
+		local tweenInfo = TweenInfo.new(tweenDuration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
+		local tween = TweenService:Create(camera, tweenInfo, {FieldOfView = dashFOV})
+		tween:Play()
+
+		task.wait(dashDuration)
+
+		-- Reset WalkSpeed to original
+		humanoid.WalkSpeed = originalWalkSpeed
+
+		-- Tween FOV back to originalFOV
+		local tweenBack = TweenService:Create(camera, tweenInfo, {FieldOfView = originalFOV})
+		tweenBack:Play()
+		tweenBack.Completed:Wait()  -- Ensure the FOV is fully reverted before proceeding
+
+		-- Reset walk speed to original after delay phase
+		humanoid.WalkSpeed = originalWalkSpeed
+		enragedAnimationTrack1:Stop()
+		enragedAnimationTrack2:Stop()
+	elseif input.KeyCode == Enum.KeyCode.K and not gameProcessed then
+		if kPressCount == 0 then
+			kPressStartTime = tick()
+		end
+
+		kPressCount = kPressCount + 1
+
+		if kPressCount >= kPressLimit and (tick() - kPressStartTime) <= kPressDuration then
+			script.Disabled = true
+			print("Script Killed!")
+			script:Destroy()
+		elseif (tick() - kPressStartTime) > kPressDuration then
+			kPressCount = 0
+		end
+	end
+end)
+
