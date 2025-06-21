@@ -1,0 +1,88 @@
+local UserInputService = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:FindFirstChildOfClass("Humanoid")
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+local camera = workspace.CurrentCamera
+
+local dashSpeed = 400  -- Adjust this value to control the dash speed
+local dashDuration = 0.2
+local tweenDuration = 0.09  -- New variable to control the duration of the FOV tween
+local dashFOVIncrease = 10  -- Amount to increase FOV during dash
+
+local kPressCount = 0
+local kPressStartTime = 0
+local kPressLimit = 5
+local kPressDuration = 5
+
+local dashAnimationId = "rbxassetid://135808540475583"
+local dashAnimation = Instance.new("Animation")
+dashAnimation.AnimationId = dashAnimationId
+local animationTrack = humanoid:LoadAnimation(dashAnimation)
+
+-- Set the animation priority to Action to ensure it overrides other animations
+animationTrack.Priority = Enum.AnimationPriority.Action
+
+local animationSpeedMultiplier = 2  -- New variable to control the speed of the dash animation
+
+local canDash = true  -- New variable to track dash availability
+local dashCooldown = 2  -- Cooldown duration in seconds
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if input.KeyCode == Enum.KeyCode.G and not gameProcessed and canDash and not script.Disabled then
+		canDash = false  -- Disable dashing
+
+		-- Update OriginalFov before the dash phase
+		local originalFOV = camera.FieldOfView
+		local dashFOV = originalFOV + dashFOVIncrease
+
+		local originalWalkSpeed = humanoid.WalkSpeed
+		humanoid.WalkSpeed = dashSpeed
+
+		-- Stop all currently playing animations before starting the dash animation
+		for _, track in humanoid:GetPlayingAnimationTracks() do
+			track:Stop()
+		end
+
+		-- Play dash animation with speed multiplier
+		animationTrack:Play()
+		animationTrack:AdjustSpeed(animationSpeedMultiplier)
+
+		-- Tween FOV to dashFOV
+		local tweenInfo = TweenInfo.new(tweenDuration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
+		local tween = TweenService:Create(camera, tweenInfo, {FieldOfView = dashFOV})
+		tween:Play()
+
+		task.wait(dashDuration)
+
+		-- Reset WalkSpeed to original
+		humanoid.WalkSpeed = originalWalkSpeed
+
+		-- Tween FOV back to originalFOV
+		local tweenBack = TweenService:Create(camera, tweenInfo, {FieldOfView = originalFOV})
+		tweenBack:Play()
+		tweenBack.Completed:Wait()  -- Ensure the FOV is fully reverted before proceeding
+
+		-- Set a delay for the cooldown
+		task.delay(dashCooldown, function()
+			canDash = true  -- Re-enable dashing after cooldown
+		end)
+	elseif input.KeyCode == Enum.KeyCode.K and not gameProcessed then
+		if kPressCount == 0 then
+			kPressStartTime = tick()
+		end
+
+		kPressCount = kPressCount + 1
+
+		if kPressCount >= kPressLimit and (tick() - kPressStartTime) <= kPressDuration then
+			script.Disabled = true
+			print("Script Killed!")
+			script:Destroy()
+		elseif (tick() - kPressStartTime) > kPressDuration then
+			kPressCount = 0
+		end
+	end
+end)
